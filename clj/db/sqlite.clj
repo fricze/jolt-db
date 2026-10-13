@@ -9,11 +9,15 @@
 ;; this namespace is required, so the bindings below resolve.
 
 ;; --- bindings ----------------------------------------------------------------
-(ffi/defcfn sqlite3-open          "sqlite3_open"          [:string :pointer] :int)
+;; sqlite3_open and sqlite3_step touch the disk, and step can wait out another connection's
+;; lock (busy_timeout), so they are :blocking: an unmarked foreign call stops garbage
+;; collection process-wide while it runs. :blocking can't take a :string, so open takes the
+;; path as a native copy.
+(ffi/defcfn sqlite3-open          "sqlite3_open"          [:pointer :pointer] :int :blocking)
 (ffi/defcfn sqlite3-close         "sqlite3_close"         [:pointer] :int)
 (ffi/defcfn sqlite3-errmsg        "sqlite3_errmsg"        [:pointer] :string)
 (ffi/defcfn sqlite3-prepare       "sqlite3_prepare_v2"    [:pointer :string :int :pointer :pointer] :int)
-(ffi/defcfn sqlite3-step          "sqlite3_step"          [:pointer] :int)
+(ffi/defcfn sqlite3-step          "sqlite3_step"          [:pointer] :int :blocking)
 (ffi/defcfn sqlite3-finalize      "sqlite3_finalize"      [:pointer] :int)
 (ffi/defcfn sqlite3-column-count  "sqlite3_column_count"  [:pointer] :int)
 (ffi/defcfn sqlite3-column-name   "sqlite3_column_name"   [:pointer :int] :string)
@@ -46,7 +50,7 @@
   [path]
   (let [pp (ffi/alloc (ffi/sizeof :pointer))]
     (try
-      (let [rc (sqlite3-open path pp)
+      (let [rc (ffi/with-c-string [p path] (sqlite3-open p pp))
             db (ffi/read pp :pointer)]
         (when-not (= rc SQLITE-OK)
           (throw (ex-info (str "sqlite open failed: " path)

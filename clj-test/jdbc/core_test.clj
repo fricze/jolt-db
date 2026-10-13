@@ -4,6 +4,7 @@
   ;; construction at the native drivers. jdbc.core below is the published
   ;; clojure.jdbc running on top of it.
   (:require [db.jdbc]
+            [babashka.fs :as fs]
             [next-jdbc-test]
             [jdbc.core :as jdbc]
             ;; the placeholder rewriter lives in the pg driver; requiring it here
@@ -293,6 +294,39 @@
   (with-open [conn (java.sql.DriverManager/getConnection "jdbc:sqlite://localhost:5432/:memory:")]
     (check "DriverManager sqlite url with host and port" [{:one 1}]
            (jdbc/fetch conn "select 1 as one")))
+
+  ;; A foreign call that waits (network, disk, a lock) must be :blocking. An unmarked one stops
+  ;; garbage collection process-wide while it runs: every other thread freezes at its next
+  ;; allocation until the call returns. Measured as the longest pause of an allocating thread.
+  (println "blocking foreign calls")
+  (let [longest-pause-ms
+        (fn [f]
+          (let [stop (atom false) gap (atom 0)
+                w (future (loop [last (System/nanoTime)]
+                            (when-not @stop
+                              (dotimes [_ 200] (vec (range 200)))
+                              (let [now (System/nanoTime)] (swap! gap max (- now last)) (recur now)))))]
+            (Thread/sleep 100)
+            (reset! gap 0)
+            (try (f) (catch Throwable _))
+            (reset! stop true)
+            @w
+            (quot @gap 1000000)))]
+    ;; Each wait below is ~1s, the full pause when the call is unmarked. A marked call pauses
+    ;; for ordinary GC only (~30ms on a laptop, ~250ms seen on a cold first run): hence 500ms.
+    (let [path (str (fs/create-temp-dir) "/busy.db")]
+      (with-open [a (jdbc/connection (str "sqlite:" path))
+                  b (jdbc/connection (str "sqlite:" path))]
+        (jdbc/execute! a "create table t (x integer)")
+        (jdbc/fetch b "pragma busy_timeout = 1000")
+        (jdbc/execute! a "begin immediate") ; a holds the write lock; b's insert waits in sqlite3_step
+        (let [ms (longest-pause-ms #(jdbc/execute! b "insert into t values (1)"))]
+          (check (str "sqlite step waiting on a lock lets other threads run (" ms " ms pause)") true (< ms 500)))
+        (jdbc/execute! a "rollback")))
+    (when-let [pg-uri (System/getenv "JOLT_TEST_PG_URI")]
+      (with-open [conn (jdbc/connection pg-uri)]
+        (let [ms (longest-pause-ms #(jdbc/fetch conn "select pg_sleep(1)"))]
+          (check (str "pg query in flight lets other threads run (" ms " ms pause)") true (< ms 500))))))
 
   (next-jdbc-test/run check)
 

@@ -13,11 +13,16 @@
 ;; opens a postgres connection: ffi/defcfn resolves a symbol on first call, so this
 ;; namespace loads either way.
 
-(ffi/defcfn PQconnectdb        "PQconnectdb"        [:string] :pointer)
+;; PQconnectdb and PQexecParams wait on the network, so they are :blocking. An unmarked
+;; foreign call stops garbage collection process-wide while it runs: every other thread
+;; would freeze at its next allocation until the server answered. :blocking can't take a
+;; :string (the collector may move it while this thread is inside C), so both take their
+;; text as a native copy (ffi/with-c-string at the call sites).
+(ffi/defcfn PQconnectdb        "PQconnectdb"        [:pointer] :pointer :blocking)
 (ffi/defcfn PQstatus           "PQstatus"           [:pointer] :int)
 (ffi/defcfn PQerrorMessage     "PQerrorMessage"     [:pointer] :string)
 (ffi/defcfn PQfinish           "PQfinish"           [:pointer] :void)
-(ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :string :int :pointer :pointer :pointer :pointer :int] :pointer)
+(ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :pointer :int :pointer :pointer :pointer :pointer :int] :pointer :blocking)
 (ffi/defcfn PQresultStatus     "PQresultStatus"     [:pointer] :int)
 (ffi/defcfn PQresultErrorMessage "PQresultErrorMessage" [:pointer] :string)
 (ffi/defcfn PQcmdTuples         "PQcmdTuples"         [:pointer] :string)
@@ -52,7 +57,7 @@
    1115 1114, 1185 1184, 1182 1082, 1183 1083, 1270 1266})
 
 (defn connect [uri]
-  (let [conn (PQconnectdb uri)]
+  (let [conn (ffi/with-c-string [p uri] (PQconnectdb p))]
     (when-not (= CONNECTION-OK (PQstatus conn))
       (let [msg (PQerrorMessage conn)] (PQfinish conn)
         (throw (ex-info (str "pg connect failed: " msg) {:jdbc/sql-error true}))))
@@ -294,10 +299,11 @@
 
 (defn- run [conn sql params]
   (let [[types values lengths formats owned] (param-arrays params)
-        ;; callers write JDBC ? placeholders; postgres wants $1..$N
-        res (PQexecParams conn (pg-placeholders sql) (count params)
-                          types values lengths formats 0)]
-    (doseq [p owned] (ffi/free p))
+        res (try
+              ;; callers write JDBC ? placeholders; postgres wants $1..$N
+              (ffi/with-c-string [q (pg-placeholders sql)]
+                (PQexecParams conn q (count params) types values lengths formats 0))
+              (finally (doseq [p owned] (ffi/free p))))]
     (let [st (PQresultStatus res)]
       (when-not (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
         (let [msg (PQresultErrorMessage res)] (PQclear res)
